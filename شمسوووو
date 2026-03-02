@@ -1,0 +1,488 @@
+import telebot
+from telebot import types
+import requests
+import random
+import time
+import json
+import os
+import logging
+import threading
+from datetime import datetime
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+BOT_TOKEN = "8776555278:AAGaq0N5wi-GddA4gY0xxx6FWd0xThkZjTc"
+# القنوات التي طلبت إضافتها
+CHANNELS = ["@Djezzy01", "@NETALG", "@px2_a"] 
+
+logging.basicConfig(
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('djezzy_bot.log'),
+        logging.StreamHandler()
+    ]
+)
+
+session = requests.Session()
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount("http://", adapter)
+session.mount("https://", adapter)
+
+HEADERS = {
+    'User-Agent': "MobileApp/3.0.0",
+    'Accept': "application/json",
+    'Content-Type': "application/json",
+    'accept-language': "ar",
+    'Connection': "keep-alive"
+}
+
+user_sessions = {}
+user_states = {}
+data_lock = threading.Lock()
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
+
+
+def safe_save_user_data(chat_id, key, value):
+   
+    with data_lock:
+        if chat_id not in user_sessions:
+            user_sessions[chat_id] = {}
+        user_sessions[chat_id][key] = value
+
+def safe_get_user_data(chat_id, key, default=None):
+    with data_lock:
+        if chat_id in user_sessions:
+            return user_sessions[chat_id].get(key, default)
+        return default
+
+def safe_set_state(chat_id, state):
+   
+    with data_lock:
+        user_states[chat_id] = state
+
+def safe_get_state(chat_id):
+    with data_lock:
+        return user_states.get(chat_id)
+
+def safe_delete_user(chat_id):
+    with data_lock:
+        if chat_id in user_sessions:
+            del user_sessions[chat_id]
+        if chat_id in user_states:
+            del user_states[chat_id]
+
+def format_num(phone):
+    
+    try:
+        phone = str(phone).strip()
+        phone = ''.join(filter(str.isdigit, phone))
+        if phone.startswith('0'):
+            return "213" + phone[1:]
+        elif not phone.startswith('213'):
+            return "213" + phone
+        return phone
+    except:
+        return phone
+
+def generate_random_djezzy_no():
+   
+    try:
+        prefix = random.choice(["077", "078", "079"])
+        return prefix + "".join([str(random.randint(0, 9)) for _ in range(7)])
+    except:
+        return "0770000000"
+
+def request_otp(msisdn):
+    for attempt in range(3):
+        try:
+            url = "https://apim.djezzy.dz/mobile-api/oauth2/registration"
+            params = {
+                'msisdn': msisdn,
+                'client_id': "87pIExRhxBb3_wGsA5eSEfyATloa",
+                'scope': "smsotp"
+            }
+            payload = {
+                "consent-agreement": [{"marketing-notifications": False}],
+                "is-consent": True
+            }
+            response = session.post(url, params=params, json=payload, headers=HEADERS, timeout=15)
+            if response.status_code in [200, 201]:
+                return response
+            time.sleep(1)
+        except Exception as e:
+            logging.error(f"خطأ في طلب OTP (محاولة {attempt + 1}): {e}")
+            time.sleep(2)
+    return None
+
+def login_with_otp(mobile_number, otp):
+    for attempt in range(3):
+        try:
+            payload = {
+                'otp': otp,
+                'mobileNumber': mobile_number,
+                'scope': "djezzyAppV2",
+                'client_id': "87pIExRhxBb3_wGsA5eSEfyATloa",
+                'client_secret': "uf82p68Bgisp8Yg1Uz8Pf6_v1XYa",
+                'grant_type': "mobile"
+            }
+            res = session.post(
+                "https://apim.djezzy.dz/mobile-api/oauth2/token",
+                data=payload,
+                headers={'User-Agent': "MobileApp/3.0.0"},
+                timeout=15
+            )
+            if res.status_code == 200:
+                return f"Bearer {res.json().get('access_token')}"
+            time.sleep(1)
+        except Exception as e:
+            logging.error(f"خطأ في تسجيل الدخول (محاولة {attempt + 1}): {e}")
+            time.sleep(2)
+    return None
+
+def send_invitation(token, sender, receiver):
+
+    try:
+        inv = session.post(
+            f"https://apim.djezzy.dz/mobile-api/api/v1/services/mgm/send-invitation/{sender}",
+            json={"msisdnReciever": receiver},
+            headers={**HEADERS, 'authorization': token},
+            timeout=10
+        )
+        return inv.status_code in [200, 201]
+    except Exception as e:
+        logging.error(f"خطأ في إرسال الدعوة: {e}")
+        return False
+
+def activate_reward(token, sender):
+    try:
+        act = session.post(
+            f"https://apim.djezzy.dz/mobile-api/api/v1/services/mgm/activate-reward/{sender}",
+            json={"packageCode": "MGMBONUS1Go"},
+            headers={**HEADERS, 'authorization': token},
+            timeout=10
+        )
+        return act.status_code in [200, 201]
+    except Exception as e:
+        logging.error(f"خطأ في تفعيل المكافأة: {e}")
+        return False
+
+def is_subscribed(user_id):
+    try:
+        for channel in CHANNELS:
+            member = bot.get_chat_member(channel, user_id)
+            if member.status not in ["member", "administrator", "creator"]:
+                return False
+        return True
+    except Exception as e:
+        logging.error(f"خطأ في التحقق من الاشتراك: {e}")
+        return False
+
+def get_subscribe_keyboard():
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    # إضافة روابط القنوات الثلاث
+    for i, channel in enumerate(CHANNELS, 1):
+        markup.add(types.InlineKeyboardButton(f"📢 اشترك في القناة {i}", url=f"https://t.me/{channel[1:]}"))
+    
+    markup.add(types.InlineKeyboardButton("✅ تحقق من الاشتراك", callback_data="check_sub"))
+    return markup
+
+def get_main_keyboard():
+    
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🚀 تفعيل 1GB", callback_data="activate"),
+        types.InlineKeyboardButton("📢 القنوات", callback_data="show_channels")
+    )
+    return markup
+
+def get_final_keyboard():
+    """الكيبورد النهائي بعد التفعيل"""
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        types.InlineKeyboardButton("🚀 تفعيل مرة أخرى", callback_data="activate"),
+        types.InlineKeyboardButton("📢 القنوات", callback_data="show_channels")
+    )
+    return markup
+
+@bot.message_handler(commands=['start'])
+def start(message):
+    
+    chat_id = message.chat.id
+    
+    if not is_subscribed(chat_id):
+        bot.send_message(
+            chat_id,
+            "<b>🚫 يجب الاشتراك في القنوات أولاً لاستخدام البوت!</b>",
+            reply_markup=get_subscribe_keyboard()
+        )
+        return
+    
+    welcome_msg = """
+<b>مرحباً بك في بوت تفعيل 1GB من جيزي 🚀</b>
+
+<b>الطريقة بسيطة:</b>
+1️⃣ اضغط على زر التفعيل
+2️⃣ أرسل رقم هاتفك (مثال: 0770123456)
+3️⃣ أدخل رمز التحقق المرسل إليك
+4️⃣ انتظر لحظة وسيتم التفعيل ✅
+
+"""
+    bot.send_message(chat_id, welcome_msg, reply_markup=get_main_keyboard())
+
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    """معالج الأزرار"""
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    
+    if call.data == "check_sub":
+        if is_subscribed(chat_id):
+            welcome_msg = """
+<b>✅ تم التحقق بنجاح!</b>
+
+مرحباً بك في بوت تفعيل 1GB من جيزي 🚀
+
+اضغط على زر التفعيل للبدء
+"""
+            try:
+                bot.edit_message_text(
+                    welcome_msg,
+                    chat_id,
+                    message_id,
+                    reply_markup=get_main_keyboard()
+                )
+            except:
+                bot.send_message(chat_id, welcome_msg, reply_markup=get_main_keyboard())
+            bot.answer_callback_query(call.id, "✅ تم التحقق بنجاح")
+        else:
+            bot.answer_callback_query(call.id, "❌ لم تشترك بعد في القنوات!", show_alert=True)
+    
+    elif call.data == "show_channels":
+        bot.send_message(chat_id, "📢 يجب الاشتراك في هذه القنوات:", reply_markup=get_subscribe_keyboard())
+
+    elif call.data == "activate":
+        if not is_subscribed(chat_id):
+            bot.edit_message_text(
+                "<b>🚫 يجب الاشتراك في القنوات أولاً!</b>",
+                chat_id,
+                message_id,
+                reply_markup=get_subscribe_keyboard()
+            )
+            return
+        
+        safe_set_state(chat_id, 'waiting_phone')
+        bot.edit_message_text(
+            "<b>📱 أرسل رقم جيزي الخاص بك:</b>\nمثال: 0770123456",
+            chat_id,
+            message_id
+        )
+        bot.answer_callback_query(call.id)
+
+@bot.message_handler(func=lambda m: m.text and len(m.text) >= 9 and m.text[0] in ['0', '7'])
+def handle_phone(message):
+    
+    chat_id = message.chat.id
+    
+    if safe_get_state(chat_id) != 'waiting_phone':
+        return
+    
+    if not is_subscribed(chat_id):
+        bot.send_message(chat_id, "🚫 يجب الاشتراك في القنوات!", reply_markup=get_subscribe_keyboard())
+        safe_delete_user(chat_id)
+        return
+    
+    phone = format_num(message.text)
+    safe_save_user_data(chat_id, 'phone', phone)
+    
+    status_msg = bot.send_message(chat_id, "⏳ جاري إرسال رمز التحقق...")
+    
+    resp = request_otp(phone)
+    
+    if resp and resp.status_code in [200, 201]:
+        safe_set_state(chat_id, 'waiting_otp')
+        try:
+            bot.edit_message_text(
+                "✅ تم إرسال الرمز بنجاح!\n\n📨 أدخل رمز التحقق (6 أرقام):",
+                chat_id,
+                status_msg.message_id
+            )
+        except:
+            bot.send_message(chat_id, "✅ تم إرسال الرمز!\n📨 أدخل رمز التحقق (6 أرقام):")
+    else:
+        try:
+            bot.edit_message_text(
+                "❌ فشل إرسال الرمز.\nتأكد من الرقم وحاول مجدداً.",
+                chat_id,
+                status_msg.message_id,
+                reply_markup=get_main_keyboard()
+            )
+        except:
+            bot.send_message(chat_id, "❌ فشل إرسال الرمز.", reply_markup=get_main_keyboard())
+        safe_delete_user(chat_id)
+
+@bot.message_handler(func=lambda m: m.text and m.text.isdigit() and len(m.text) == 6)
+def handle_otp(message):
+    
+    chat_id = message.chat.id
+    
+    if safe_get_state(chat_id) != 'waiting_otp':
+        return
+    
+    if not is_subscribed(chat_id):
+        bot.send_message(chat_id, "🚫 يجب الاشتراك في القنوات!", reply_markup=get_subscribe_keyboard())
+        safe_delete_user(chat_id)
+        return
+    
+    otp = message.text
+    phone = safe_get_user_data(chat_id, 'phone')
+    
+    if not phone:
+        bot.send_message(chat_id, "❌ حدث خطأ، أعد المحاولة من البداية.", reply_markup=get_main_keyboard())
+        safe_delete_user(chat_id)
+        return
+    
+    status_msg = bot.send_message(chat_id, "🔄 جاري التفعيل...")
+    
+    token = login_with_otp(phone, otp)
+    
+    if not token:
+        try:
+            bot.edit_message_text(
+                "❌ رمز التحقق غير صحيح أو انتهت صلاحيته.",
+                chat_id,
+                status_msg.message_id,
+                reply_markup=get_main_keyboard()
+            )
+        except:
+            bot.send_message(chat_id, "❌ رمز التحقق غير صحيح.", reply_markup=get_main_keyboard())
+        safe_delete_user(chat_id)
+        return
+    
+    max_attempts = 30
+    success = False
+    
+    for attempt in range(1, max_attempts + 1):
+        try:
+            target = generate_random_djezzy_no()
+            target_f = format_num(target)
+                                   
+            if send_invitation(token, phone, target_f):
+               
+                request_otp(target_f)
+                time.sleep(1.5)
+                               
+                if activate_reward(token, phone):
+                    success = True
+                    
+                    success_msg = f"""
+<b>✅ تم التفعيل بنجاح! 🎉</b>
+
+تم تفعيل 1GB على رقمك
+
+<b>شكراً لاستخدام البوت</b>
+📢 {CHANNELS[0]}
+"""
+                    try:
+                        bot.edit_message_text(
+                            success_msg,
+                            chat_id,
+                            status_msg.message_id,
+                            reply_markup=get_final_keyboard()
+                        )
+                    except:
+                        bot.send_message(chat_id, success_msg, reply_markup=get_final_keyboard())
+                    break
+            
+            time.sleep(1)
+            
+        except Exception as e:
+            logging.error(f"خطأ في المحاولة {attempt}: {e}")
+            continue
+    
+    if not success:
+        fail_msg = f"""
+<b>❌ لم نتمكن من التفعيل حالياً</b>
+
+حاول مرة أخرى لاحقاً
+قد يكون الرقم غير مؤهل حالياً
+
+📢 {CHANNELS[0]}
+"""
+        try:
+            bot.edit_message_text(
+                fail_msg,
+                chat_id,
+                status_msg.message_id,
+                reply_markup=get_final_keyboard()
+            )
+        except:
+            bot.send_message(chat_id, fail_msg, reply_markup=get_final_keyboard())
+    
+    
+    safe_delete_user(chat_id)
+
+@bot.message_handler(func=lambda m: True)
+def handle_other(message):
+    
+    chat_id = message.chat.id
+    
+    if not is_subscribed(chat_id):
+        bot.send_message(
+            chat_id,
+            "<b>🚫 يجب الاشتراك في القنوات أولاً!</b>",
+            reply_markup=get_subscribe_keyboard()
+        )
+        return
+    
+    state = safe_get_state(chat_id)
+    
+    if state == 'waiting_phone':
+        bot.send_message(chat_id, "❌ أرسل رقم صحيح (مثال: 0770123456)")
+    elif state == 'waiting_otp':
+        bot.send_message(chat_id, "❌ أرسل رمز التحقق المكون من 6 أرقام")
+    else:
+        bot.send_message(chat_id, "👋 اضغط /start للبدء", reply_markup=get_main_keyboard())
+
+def run_bot():
+   
+    restart_count = 0
+    
+    while True:
+        try:
+            print("=" * 60)
+            print("🤖 بوت تفعيل 1GB من جيزي يعمل الآن")
+            print(f"📢 القنوات: {', '.join(CHANNELS)}")
+            print(f"🔄 عدد مرات إعادة التشغيل: {restart_count}")
+            print("=" * 60)
+                       
+            with data_lock:
+                if len(user_sessions) > 500:
+                    user_sessions.clear()
+                    user_states.clear()
+            
+            restart_count += 1
+            bot.infinity_polling(timeout=20, long_polling_timeout=20, skip_pending=True)
+            
+        except Exception as e:
+            logging.error(f"خطأ في تشغيل البوت: {e}")
+            print(f"⚠️ خطأ: {e} - إعادة التشغيل خلال 3 ثوان...")
+            time.sleep(3)
+            continue
+
+if __name__ == '__main__':
+    try:
+        run_bot()
+    except KeyboardInterrupt:
+        print("\n👋 تم إيقاف البوت يدوياً")
+    except Exception as e:
+        print(f"❌ خطأ غير متوقع: {e}")
+        time.sleep(3)
+        os.system(f"python {__file__}") 
